@@ -41,6 +41,8 @@ add_arg("per_device_eval_batch_size",  type=int, default=8,    help="评估的ba
 add_arg("gradient_accumulation_steps", type=int, default=1,    help="梯度累积步数")
 add_arg("push_to_hub",                 type=bool, default=False, help="是否将模型权重推到HuggingFace Hub")
 add_arg("hub_model_id",                type=str,  default=None,  help="HuggingFace Hub上的模型仓库ID")
+add_arg("deepspeed",                   type=str,  default=None,  help="DeepSpeed配置文件路径")
+add_arg("local_rank", type=int, default=0,help="deepspeed local rank (placebo)")
 args = parser.parse_args()
 print_arguments(args)
 
@@ -78,37 +80,10 @@ def main():
     if ddp:
         device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
 
-    # 获取模型
-    model = WhisperForConditionalGeneration.from_pretrained(args.base_model,
-                                                            load_in_8bit=args.use_8bit,
-                                                            device_map=device_map,
-                                                            local_files_only=args.local_files_only)
-    model.config.forced_decoder_ids = None
-    model.config.suppress_tokens = []
-    # 量化模型
-    model = prepare_model_for_kbit_training(model)
-    # 注册forward，否则多卡训练会失败
-    model.model.encoder.conv1.register_forward_hook(make_inputs_require_grad)
-
-    print('加载LoRA模块...')
-    if args.resume_from_checkpoint:
-        # 恢复训练时加载Lora参数
-        print("Loading adapters from checkpoint.")
-        model = PeftModel.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True)
-    else:
-        print(f'adding LoRA modules...')
-        target_modules = ["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"]
-        print(target_modules)
-        if args.use_adalora:
-            config = AdaLoraConfig(init_r=12, target_r=4, beta1=0.85, beta2=0.85, tinit=200, tfinal=1000, deltaT=10,
-                                   lora_alpha=32, lora_dropout=0.1, orth_reg_weight=0.5, target_modules=target_modules)
-        else:
-            config = LoraConfig(r=32, lora_alpha=64, target_modules=target_modules, lora_dropout=0.05, bias="none")
-        model = get_peft_model(model, config)
-
     if args.base_model.endswith("/"):
         args.base_model = args.base_model[:-1]
     output_dir = os.path.join(args.output_dir, os.path.basename(args.base_model))
+
     # 定义训练参数
     training_args = \
         Seq2SeqTrainingArguments(output_dir=output_dir,  # 保存检查点和意志的目录
@@ -134,7 +109,37 @@ def main():
                                  remove_unused_columns=False,  # 删除模型不需要的数据列
                                  label_names=["labels"],  # 与标签对应的输入字典中的键列表
                                  push_to_hub=args.push_to_hub,
+                                 deepspeed=args.deepspeed,
+                                 gradient_checkpointing=True if not args.deepspeed == None else False
                                  )
+
+    # 获取模型
+    model = WhisperForConditionalGeneration.from_pretrained(args.base_model,
+                                                            load_in_8bit=args.use_8bit,
+                                                            local_files_only=args.local_files_only)
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    # 量化模型
+    model = prepare_model_for_kbit_training(model)
+    # 注册forward，否则多卡训练会失败
+    model.model.encoder.conv1.register_forward_hook(make_inputs_require_grad)
+
+    print('加载LoRA模块...')
+    if args.resume_from_checkpoint:
+        # 恢复训练时加载Lora参数
+        print("Loading adapters from checkpoint.")
+        model = PeftModel.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True)
+    else:
+        print(f'adding LoRA modules...')
+        target_modules = ["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"]
+        print(target_modules)
+        if args.use_adalora:
+            config = AdaLoraConfig(init_r=12, target_r=4, beta1=0.85, beta2=0.85, tinit=200, tfinal=1000, deltaT=10,
+                                   lora_alpha=32, lora_dropout=0.1, orth_reg_weight=0.5, target_modules=target_modules)
+        else:
+            config = LoraConfig(r=32, lora_alpha=64, target_modules=target_modules, lora_dropout=0.05, bias="none")
+        model = get_peft_model(model, config)
+    
 
     if training_args.local_rank == 0 or training_args.local_rank == -1:
         print('=' * 90)
